@@ -1,0 +1,195 @@
+import groovy.transform.Field
+
+@Field final String VERSION_ARTIFACTS_FILE_NAME = "alps-devops-infra-docker-version"
+
+String getVersion(String version) {
+    if (version == "auto assign") {
+        copyArtifacts(
+            projectName: "${env.JOB_NAME}",
+            filter: "${VERSION_ARTIFACTS_FILE_NAME}",
+            selector: lastSuccessful(),
+            fingerprintArtifacts: true
+        )
+        String v = readFile(file: "${VERSION_ARTIFACTS_FILE_NAME}")
+        String[] parts = v.split('\\.')
+        parts[parts.size() -1] = (Integer.valueOf(parts.last()) + 1).toString()
+
+        version = parts.join('.') 
+    } else {
+        assert version =~ /\d+.\d+.\d+/
+    }
+
+    return version
+}
+pipeline {
+    agent {
+        label 'aosp'     
+    }
+    
+    options {
+        buildDiscarder logRotator(numToKeepStr: '20')
+        disableConcurrentBuilds()
+        timestamps()
+        ansiColor('xterm')
+        withCredentials([usernamePassword(credentialsId: 'nexus_2', passwordVariable: 'NEXUS_PSW', usernameVariable: 'NEXUS_USR'),
+                         file(credentialsId: 'firebase.json.prod', variable: 'GOOGLE_SERVICES_PROD_PATH')])
+    }
+    
+    parameters {
+        booleanParam(defaultValue: false,description: 'Read Jenkinsfile to refresh parameters and stop job',name: 'REFRESH')
+	    booleanParam(defaultValue: false, description: 'Choose device version for deploy', name: 'DEVICE_DEPLOY')
+	    choice(choices: ['-', 'device_generic_goldfish', 'device_google_bluejay', 'device_google_bramble', 'packages_apps_ManagedProvisioning', 'packages_services_Telephony','platform_manifest, vendor_gms'], description: 'Choose device name', name: 'DEVICE_NAME')
+    }
+    
+    environment {
+        REFRESH = "${params.REFRESH}"
+        DOCKER_IMAGE_VERSION = '1.0'
+        DOCKER_IMAGE_NAME = 'alps-test-aosp-build'   
+        
+        
+    }
+    
+    stages {
+        stage("Parameterizing First Time") {
+            steps {
+                script {
+                    echo "BUILD_NUMBER: ${env.BUILD_NUMBER}"
+                    if (env.BUILD_NUMBER.equals("1") && currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause') != null) {
+                        currentBuild.displayName = "#${env.BUILD_NUMBER}  Parameters loading..."
+                        currentBuild.result = 'ABORTED'
+                        error "DRY RUN COMPLETED. JOB PARAMETERIZED."
+                    }
+                }
+            }
+        }
+        
+        stage("Parameterizing N Time") {
+            when {
+                expression { params.REFRESH == true }
+            }
+            steps {
+                script {
+                    currentBuild.result = 'ABORTED'
+                    currentBuild.displayName = "#${env.BUILD_NUMBER}  Parameters loading..."
+                    error "DRY RUN COMPLETED. JOB PARAMETERIZED."
+                }
+            }
+        }
+
+        stage("Pull Docker agent") {
+             agent {
+                docker { image "docker-registry:5000/alps-test-aosp-build:${DOCKER_IMAGE_VERSION}"
+                    reuseNode true
+                    args '-v /var/run/docker.sock:/var/run/docker.sock'
+                } //This makes the original workspace availiable inside of docker container
+            }
+            environment {
+                HOME = '.'
+                //This is required to avoid "node" user from trying to create files in the system paths.
+                AWS_SHARED_CREDENTIALS_FILE = "/tmp/credentials"    
+            }
+            steps {
+                
+                sh "docker pull ${env.DOCKER_IMAGE_NAME}:${env.DOCKER_IMAGE_VERSION}"
+            }
+        }
+
+        
+
+       
+        stage("Build AOSP Image") {
+            steps {
+                sh 'mkdir -p aosp/a13'
+                dir('aosp/a13') {
+                    // Initialize the repository
+                    
+		            sh 'repo init -u ssh://git@bitbucket.trustonic.internal:7999/AOSP/platform_manifest -b release/A13 --partial-clone --clone-filter=blob:limit=10M'
+                     // Download the source code
+                    sh 'cd ~/aosp/a13 && repo sync'
+                    					                   
+                  
+                }
+            }
+        }
+
+        stage('Build Device Image') {
+            steps {
+                script {
+                    // Select the device based on the parameter value
+                    def deviceName = "${params.DEVICE_NAME}"
+                    def lunchConfig
+                    
+                    if (deviceName == 'device_generic_goldfish') {
+                        lunchConfig = 'aosp_generic_goldfish-eng'
+                    } else if (deviceName == 'device_google_bluejay') {
+                        lunchConfig = 'aosp_bluejay-userdebug'
+                    } else if (deviceName == 'device_google_bramble') {
+                        lunchConfig = 'aosp_bramble-userdebug'
+                    } else if (deviceName == 'packages_apps_ManagedProvisioning') {
+                        lunchConfig = 'aosp_apps_ManagedProvisioning-eng'
+                    } else if (deviceName == 'packages_services_Telephony') {
+                        lunchConfig = 'aosp_services_Telephony-eng'
+                    } else if (deviceName == 'platform_manifest') {
+                        lunchConfig = 'aosp_platform_manifest-eng'
+                    } else if (deviceName == 'vendor_gms') {
+                        lunchConfig = 'aosp_vendor_gms-eng'
+                    } else {
+                        error "Invalid device name: ${deviceName}"
+                    }
+                    
+                    // Build AOSP
+                    sh "cd ~/aosp/a13 && source build/envsetup.sh && lunch ${lunchConfig} && make -j16"
+                }
+            }
+        }
+
+        stage('Build Emulator') {
+            steps {
+                script {
+                    // Start building the emulator
+                    sh 'cd ~/aosp/a13 && source build/envsetup.sh && lunch aosp_x86_64-eng && make -j16'
+                }
+            }
+        }
+
+        stage('Export for Android Studio/AVD') {
+            steps {
+                script {
+                    // Export for Android Studio/AVD
+                    sh 'cd ~/aosp/a13 && source build/envsetup.sh && lunch sdk_phone_x86_64 && make -j16 emu_img_zip'
+                }
+            }
+        }
+
+       // stage('Package Artifacts') {
+           // steps {
+               // script {
+                    // Create a package for the artifacts
+                  //  sh 'mkdir aosp-a13'
+                   // sh "cp ${env.ARTIFACT_PATH} aosp-a13/"
+                    
+               // }
+            //}
+        //}
+
+       // stage('Push to Nexus') {
+           // steps {
+              //  script {
+                                
+                    // Push the package to Nexus if the URL is provided
+               // if (NEXUS_URL) {
+               // sh "curl -v -u ${NEXUS_USERNAME}:${NEXUS_PASSWORD} --upload-file package/ ${nexusUrl}"
+                //}
+            //}
+        //}
+    }
+     post {
+        always {
+            archiveArtifacts artifacts: VERSION_ARTIFACTS_FILE_NAME,
+                allowEmptyArchive: true,
+                fingerprint: true,
+                onlyIfSuccessful: true
+            cleanWs()
+        }
+    }
+}
